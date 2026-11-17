@@ -6,39 +6,38 @@ const kafka = new Kafka({
   brokers: ['localhost:9092'],
 });
 
-// Consumer Group: A coordinated group of consumers that share the work of consuming topics.
-// Kafka assigns each topic partition to exactly ONE consumer instance within this group.
 const consumer = kafka.consumer({
   groupId: 'payment-group',
 });
 
-// Producer: Used to publish payment outcome events to downstream topics ("payments").
+// Idempotent Producer:
+// Guarantees exactly-once write semantics per partition by assigning a producer ID
+// and sequence numbers, preventing duplicate messages on network retries.
 const producer = kafka.producer({
   idempotent: true,
   maxInFlightRequests: 1,
 });
 
-// Rebalancing: Triggered when consumer instances join, leave, or partitions change.
-// Kafka pauses consumption and reallocates partitions among the active consumers in the group.
-consumer.on(consumer.events.GROUP_JOIN, (e) => {
-  console.log(`[Rebalance Event] Joined consumer group. Member ID: ${e.payload.memberId}`);
-  console.log(`[Rebalance Event] Assigned partitions:`, JSON.stringify(e.payload.memberAssignment));
-});
+// Deduplication Store (In-Memory Set):
+// Kafka provides "at-least-once" delivery semantics; network glitches or consumer crashes
+// before an offset commit can cause identical messages to be re-delivered.
+// Tracking processed identifiers guarantees idempotency at the consumer application level.
+const processedOrderIds = new Set();
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const run = async () => {
   try {
     await producer.connect();
     await consumer.connect();
 
-    // Subscribe to "orders". fromBeginning: true reads earliest uncommitted messages on first startup
     await consumer.subscribe({
       topic: 'orders',
       fromBeginning: true,
     });
 
-    console.log(`Payment service [PID: ${process.pid}] running, waiting for orders...`);
+    console.log(`Payment service [PID: ${process.pid}] running with Retry, DLQ, and Deduplication...`);
 
-    // autoCommit: false allows Manual Offset Commits for at-least-once processing semantics
     await consumer.run({
       autoCommit: false,
       eachMessage: async ({ topic, partition, message }) => {
@@ -47,31 +46,96 @@ const run = async () => {
 
         console.log(`\n[Order Received] Partition: ${partition} | Offset: ${message.offset} | OrderId: ${orderId}`);
 
-        // Simulate payment gateway processing: 80% success, 20% failure
-        const isSuccess = Math.random() < 0.8;
-        const paymentEvent = {
-          orderId,
-          status: isSuccess ? 'success' : 'failed',
-          amount,
-          processedAt: new Date().toISOString(),
-        };
-
-        // Produce payment result to "payments" topic using orderId as key to maintain partition affinity
-        await producer.send({
-          topic: 'payments',
-          messages: [
+        // --- 1. Deduplication Check ---
+        if (processedOrderIds.has(orderId)) {
+          console.warn(`[Duplicate Skipped] Order ${orderId} has already been processed.`);
+          // Acknowledge offset immediately so we advance past the duplicate message
+          await consumer.commitOffsets([
             {
-              key: orderId,
-              value: JSON.stringify(paymentEvent),
+              topic,
+              partition,
+              offset: (BigInt(message.offset) + 1n).toString(),
             },
-          ],
-        });
+          ]);
+          return;
+        }
 
-        console.log(`[Payment Processed] OrderId: ${orderId} -> Status: ${paymentEvent.status}`);
+        // --- 2. Retry Logic with Exponential Backoff ---
+        // Retry: Handles transient failures (e.g. temporary downstream network/DB dropouts)
+        // by attempting execution multiple times before giving up.
+        const maxRetries = 3;
+        let attempt = 0;
+        let processSuccessful = false;
+        let lastError = null;
 
-        // Offset Commit: Acknowledges to Kafka that this message was successfully processed.
-        // Kafka tracks committed offsets per consumer group. We commit (offset + 1) to mark
-        // the next message to be fetched.
+        while (attempt <= maxRetries && !processSuccessful) {
+          try {
+            // Simulate random 10% transient processing crash/exception
+            if (Math.random() < 0.10) {
+              throw new Error('Simulated random processing failure (transient crash)');
+            }
+
+            // Normal business logic: simulate payment gateway (80% success, 20% decline)
+            const isSuccess = Math.random() < 0.8;
+            const paymentEvent = {
+              orderId,
+              status: isSuccess ? 'success' : 'failed',
+              amount,
+              processedAt: new Date().toISOString(),
+            };
+
+            await producer.send({
+              topic: 'payments',
+              messages: [
+                {
+                  key: orderId,
+                  value: JSON.stringify(paymentEvent),
+                },
+              ],
+            });
+
+            console.log(`[Payment Processed] OrderId: ${orderId} -> Status: ${paymentEvent.status}`);
+            processSuccessful = true;
+          } catch (error) {
+            attempt++;
+            lastError = error;
+            console.error(`[Retry Attempt ${attempt}/${maxRetries}] Failed for Order ${orderId}: ${error.message}`);
+
+            if (attempt <= maxRetries) {
+              // Exponential backoff: 1s, 2s, 4s
+              const backoffDelayMs = 1000 * Math.pow(2, attempt - 1);
+              console.log(`[Backoff] Waiting ${backoffDelayMs}ms before retrying Order ${orderId}...`);
+              await wait(backoffDelayMs);
+            }
+          }
+        }
+
+        // --- 3. Dead Letter Queue (DLQ) & Offset Commit ---
+        // DLQ: Poison pill messages or persistent errors are routed to a separate quarantine topic.
+        // This isolates bad messages for auditing/replay and allows consumer offset progression
+        // without blocking the entire partition.
+        if (!processSuccessful) {
+          console.error(`[DLQ Route] Order ${orderId} exceeded max retries. Routing to 'orders.dlq'...`);
+          await producer.send({
+            topic: 'orders.dlq',
+            messages: [
+              {
+                key: orderId,
+                value: message.value, // forward original message payload
+                headers: {
+                  error: String(lastError ? lastError.message : 'Unknown error'),
+                  retryCount: String(maxRetries),
+                },
+              },
+            ],
+          });
+          console.log(`[DLQ Sent] Order ${orderId} successfully forwarded to 'orders.dlq'.`);
+        } else {
+          // Record successful processing for deduplication
+          processedOrderIds.add(orderId);
+        }
+
+        // Commit offset to Kafka to prevent poison pills from blocking partition consumption
         await consumer.commitOffsets([
           {
             topic,
@@ -89,7 +153,7 @@ const run = async () => {
   }
 };
 
-// Graceful shutdown: Cleanly disconnect both consumer and producer on SIGINT
+// Graceful shutdown on SIGINT
 const shutdown = async () => {
   console.log(`\nShutting down Payment service [PID: ${process.pid}]...`);
   try {
@@ -107,4 +171,3 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 run();
-

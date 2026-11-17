@@ -19,13 +19,13 @@ const producer = kafka.producer({
 });
 
 app.post('/orders', async (req, res) => {
-  const { item, amount } = req.body;
+  const { item, amount, orderId: customOrderId } = req.body;
 
   if (!item || amount === undefined) {
     return res.status(400).json({ error: 'item and amount are required' });
   }
 
-  const orderId = uuidv4();
+  const orderId = customOrderId || uuidv4();
   const orderEvent = {
     orderId,
     item,
