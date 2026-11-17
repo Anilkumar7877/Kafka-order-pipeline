@@ -106,6 +106,26 @@ Open separate terminal windows for each service:
 
 ---
 
+## Kafka UI Screenshots
+
+### 1. Cluster & Broker Health
+Overview of the single KRaft broker and partition controller status:
+![Brokers Overview](docs/images/kafka-ui-brokers.png)
+
+### 2. Topics & Partition Distribution
+Displaying the `orders` and `payments` topics with 3 partitions and message counts:
+![Topics Overview](docs/images/kafka-ui-topics.png)
+
+### 3. Messages & Partitions Inspection
+Inspecting individual records, partition routing, offsets, and payload values:
+![Messages Inspection](docs/images/kafka-ui-messages.jpg)
+
+### 4. Consumer Groups & Lag
+Tracking active consumer groups (`payment-group` and `notification-group`) and member state:
+![Consumer Groups](docs/images/kafka-ui-consumers.png)
+
+---
+
 ## What I Learned
 
 - Event-driven microservices decouple dependencies using append-only immutable logs.
